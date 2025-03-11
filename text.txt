@@ -1,0 +1,130 @@
+import os
+import cv2 as cv
+import pandas as pd
+import mediapipe as mp
+import numpy as np
+
+# เลือกจุด Landmark ที่ต้องใช้
+SELECTED_LANDMARKS = [0, 11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28]
+
+mpPose = mp.solutions.pose
+pose = mpPose.Pose(min_detection_confidence=0.8, min_tracking_confidence=0.8)
+
+
+def calculate_acceleration(prev_velocity, current_velocity, time_interval):
+    if time_interval == 0:
+        return 0
+    return (current_velocity - prev_velocity) / time_interval
+
+
+def detectPose(image, pose, prev_landmarks, prev_velocity, time_interval):
+    imgHeight, imgWidth, _ = image.shape
+    imageRGB = cv.cvtColor(image, cv.COLOR_BGR2RGB)
+    results = pose.process(imageRGB)
+
+    landmarks = []
+    neck_y = None
+
+    if results.pose_landmarks:
+        for idx, landmark in enumerate(results.pose_landmarks.landmark):
+            if idx in SELECTED_LANDMARKS:
+                landmarks.append((landmark.x * imgWidth, landmark.y * imgHeight))
+
+        left_shoulder = results.pose_landmarks.landmark[11]
+        right_shoulder = results.pose_landmarks.landmark[12]
+        neck_y = (left_shoulder.y + right_shoulder.y) / 2 * imgHeight
+
+   
+    current_velocity = None
+    acceleration = None
+
+    if prev_landmarks and landmarks:
+        # คำนวณความเร็ว (การเปลี่ยนแปลงตำแหน่งต่อเวลา)
+        displacement = np.array(landmarks) - np.array(prev_landmarks)
+        current_velocity = displacement / time_interval
+
+        # คำนวณความเร่ง (การเปลี่ยนแปลงความเร็วต่อเวลา)
+        if prev_velocity is not None:
+            acceleration = calculate_acceleration(prev_velocity, current_velocity, time_interval)
+
+    return results, landmarks, neck_y, current_velocity, acceleration
+
+
+def processFrames(input_folders, output_csv, output_image_folder):
+    data = []
+    os.makedirs(output_image_folder, exist_ok=True)
+
+    for label, folder_path in input_folders.items():
+        for subfolder in os.listdir(folder_path):
+            subfolder_path = os.path.join(folder_path, subfolder)
+
+            if os.path.isdir(subfolder_path):
+                output_subfolder = os.path.join(output_image_folder, subfolder)
+                os.makedirs(output_subfolder, exist_ok=True)
+
+                prev_landmarks = None
+                prev_velocity = None
+                time_interval = 1 / 30  
+
+                for filename in sorted(os.listdir(subfolder_path)):
+                    if filename.endswith(('.jpg', '.png')):
+                        file_path = os.path.join(subfolder_path, filename)
+                        print(f"Processing: {file_path}")
+
+                        image = cv.imread(file_path)
+                        if image is None:
+                            print(f"Error reading image: {file_path}")
+                            continue
+
+                        
+                        results, landmarks, neck_y, current_velocity, acceleration = detectPose(
+                            image, pose, prev_landmarks, prev_velocity, time_interval
+                        )
+
+                        if results.pose_landmarks:
+                            mp.solutions.drawing_utils.draw_landmarks(
+                                image, results.pose_landmarks, mpPose.POSE_CONNECTIONS
+                            )
+
+                            processed_image_path = os.path.join(output_subfolder, filename)
+                            cv.imwrite(processed_image_path, image)
+
+                        if landmarks:
+                            flattened_landmarks = [coord for landmark in landmarks for coord in landmark]
+
+                            
+                            if acceleration is not None:
+                                flattened_landmarks.extend(acceleration.flatten())
+
+                            # จำแนกท่าทาง
+                            if neck_y:
+                                if neck_y > 0.6 * image.shape[0]:
+                                    label = "FALL"
+                                elif 0.4 * image.shape[0] < neck_y <= 0.6 * image.shape[0]:
+                                    label = "ADL"
+                                else:
+                                    label = "STAY"
+
+                            data.append(flattened_landmarks + [label])
+
+                       
+                        prev_landmarks = landmarks
+                        prev_velocity = current_velocity
+
+    # บันทึกข้อมูลลง CSV
+    columns = [f'{axis}{i+1}' for i in range(len(SELECTED_LANDMARKS)) for axis in ['x', 'y']] + \
+              [f'acceleration_{i+1}' for i in range(len(SELECTED_LANDMARKS) * 2)] + ['Label']
+    df = pd.DataFrame(data, columns=columns)
+    df.to_csv(output_csv, index=False)
+
+# ข้อมูลอินพุตและเอาต์พุต
+input_folders = {
+ 
+    'fall': 'frames_fall'
+}
+
+output_csv = 'pose_data_2d_with_acceleration.csv'
+output_image_folder = 'processed_images_train'
+
+# ประมวลผลเฟรม
+processFrames(input_folders, output_csv, output_image_folder)
